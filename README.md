@@ -2,23 +2,51 @@
 
 Minimal, deterministic **EvidencePack** emission + verification for Operator microservices.
 
-Services covered:
-- Time (`/v1/time/now`, `/v1/time/convert`)
-- Geo (`/v1/geo/ip`)
-- Date (`/v1/date/today`, `/v1/date/holiday`)
-- IPDiag (`/v1/ip/diag`)
-- Media (`/v1/media/suggest`)
-- **Stripe** (`checkout.session.completed` webhook — sole payment confirmation boundary)
+## Workspace
 
-## Usage
-
-Add to your service `Cargo.toml`:
-
-```toml
-evidence_core = { git = "https://github.com/danpennic-sys/evidence-core" }
+```
+evidence-core/           (this repo)
+├── evidence_core/       shared library crate
+├── stripe-service/      full Stripe Checkout + verified webhook + EvidencePack
+└── examples/            drop-in wiring patterns for Time / Geo / Date / IPDiag / Media
 ```
 
-Then after computing a response:
+## Services covered by evidence packs
+
+| Service | Endpoints |
+|---------|-----------|
+| Time | `/v1/time/now`, `/v1/time/convert` |
+| Geo | `/v1/geo/ip` |
+| Date | `/v1/date/today`, `/v1/date/holiday` |
+| IPDiag | `/v1/ip/diag` |
+| Media | `/v1/media/suggest` |
+| **Stripe** | `checkout.session.completed` (sole payment confirmation boundary) |
+
+## Quick start — Stripe service
+
+```bash
+cp stripe-service/.env.example stripe-service/.env
+# set STRIPE_SECRET_KEY=sk_test_...
+
+cargo run -p stripe-service
+```
+
+Second terminal:
+
+```bash
+stripe listen --forward-to localhost:4242/webhook
+```
+
+Open http://localhost:4242, pay $10 with test card `4242 4242 4242 4242`.
+EvidencePack is written automatically under `evidence/`.
+
+## Library usage (other services)
+
+```toml
+evidence_core = { path = "../evidence_core" }
+# or
+evidence_core = { git = "https://github.com/danpennic-sys/evidence-core" }
+```
 
 ```rust
 use evidence_core::emit_pack;
@@ -36,43 +64,10 @@ let _pack = emit_pack(
 );
 ```
 
-See `examples/wiring_*.rs` for the exact drop-in for every endpoint.
-
-### Stripe (payment evidence)
-
-Only emit after the webhook signature is verified **and** `payment_status == "paid"`.
-This matches the quantumguard stripe-test design rule (webhook is the sole confirmation boundary).
-
-```rust
-// inside the verified webhook handler
-emit_stripe_payment(
-    &session.id,
-    session.payment_intent.as_deref(),
-    session.amount_total.unwrap_or(0),
-    &session.currency,
-    session.customer_details.as_ref().and_then(|c| c.email.as_deref()),
-    session.livemode,
-    &Utc::now().to_rfc3339(),
-);
-```
-
-Invariants enforced:
-- `STRIPE-001` signature verified
-- `STRIPE-002` payment_status == paid
-- `STRIPE-003` idempotent write
-- `STRIPE-004` no card data stored
-
-## Verification
-
-```rust
-use evidence_core::verify::{verify_pack_file, Replayable};
-
-let result = verify_pack_file("evidence/stripe_....json", Some(&replayer), Some(&expected_invariants))?;
-assert!(result.passed);
-```
+See `examples/wiring_*.rs` for every endpoint.
 
 ## Design constraints
 
-- Hash is pure function of the fields written into the pack (deterministic).
-- No network, no side-effects beyond writing the JSON file.
-- Signature is a placeholder until real Ed25519 / PQC keys land (compatible with quantumguard).
+- Hash is a pure function of the fields written into the pack (deterministic).
+- No network inside the library; only the stripe-service binary talks to Stripe.
+- Signature field is a placeholder until real Ed25519 / PQC keys land (compatible with quantumguard).
