@@ -8,6 +8,7 @@ Services covered:
 - Date (`/v1/date/today`, `/v1/date/holiday`)
 - IPDiag (`/v1/ip/diag`)
 - Media (`/v1/media/suggest`)
+- **Stripe** (`checkout.session.completed` webhook — sole payment confirmation boundary)
 
 ## Usage
 
@@ -37,12 +38,36 @@ let _pack = emit_pack(
 
 See `examples/wiring_*.rs` for the exact drop-in for every endpoint.
 
+### Stripe (payment evidence)
+
+Only emit after the webhook signature is verified **and** `payment_status == "paid"`.
+This matches the quantumguard stripe-test design rule (webhook is the sole confirmation boundary).
+
+```rust
+// inside the verified webhook handler
+emit_stripe_payment(
+    &session.id,
+    session.payment_intent.as_deref(),
+    session.amount_total.unwrap_or(0),
+    &session.currency,
+    session.customer_details.as_ref().and_then(|c| c.email.as_deref()),
+    session.livemode,
+    &Utc::now().to_rfc3339(),
+);
+```
+
+Invariants enforced:
+- `STRIPE-001` signature verified
+- `STRIPE-002` payment_status == paid
+- `STRIPE-003` idempotent write
+- `STRIPE-004` no card data stored
+
 ## Verification
 
 ```rust
 use evidence_core::verify::{verify_pack_file, Replayable};
 
-let result = verify_pack_file("evidence/geo_....json", Some(&replayer), Some(&expected_invariants))?;
+let result = verify_pack_file("evidence/stripe_....json", Some(&replayer), Some(&expected_invariants))?;
 assert!(result.passed);
 ```
 
