@@ -4,7 +4,7 @@
 //! link it to the current chain-head. The head is the only mutable
 //! pointer; every atom is immutable once written.
 
-use crate::admit::{admit, AdmitDecision, AdmitPolicy};
+use crate::admit::{admit, policy_soft_signatures, AdmitDecision, AdmitPolicy};
 use crate::EvidencePack;
 use crate::verify::Replayable;
 use serde::{Deserialize, Serialize};
@@ -18,24 +18,15 @@ pub const SATOM_DOMAIN: &[u8] = b"satom-v3:";
 /// Immutable signed envelope around an admitted EvidencePack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedAtom {
-    /// Content-addressed id = SHA-256 of the canonical atom bytes (excluding this field).
     pub atom_id: String,
-    /// Previous chain-head. "GENESIS" for the first atom.
     pub prev_head: String,
-    /// Monotonic sequence number (0-based).
     pub sequence: u64,
-    /// The admitted EvidencePack (body).
     pub body: EvidencePack,
-    /// Signature over (prev_head || sequence || body.pack_id).
-    /// Placeholder until real Ed25519 / PQC keys land.
     pub signature: String,
-    /// UTC timestamp of envelope creation (RFC3339).
     pub enveloped_at_utc: String,
 }
 
 impl SignedAtom {
-    /// Compute the deterministic atom_id from the other fields.
-    /// canonicalization.md v3 §4.2
     fn compute_id(
         prev_head: &str,
         sequence: u64,
@@ -53,8 +44,6 @@ impl SignedAtom {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Create a new SignedAtom linked to `prev_head`.
-    /// Caller is responsible for having already run admit().
     pub fn new(
         body: EvidencePack,
         prev_head: String,
@@ -80,7 +69,6 @@ impl SignedAtom {
         }
     }
 
-    /// Recompute atom_id and verify it matches the stored value.
     pub fn verify_id(&self) -> bool {
         let recomputed = Self::compute_id(
             &self.prev_head,
@@ -92,7 +80,6 @@ impl SignedAtom {
         recomputed == self.atom_id
     }
 
-    /// Persist atom under atoms/<atom_id>.json
     pub fn write_to_disk(&self, root: &Path) -> std::io::Result<()> {
         let dir = root.join("atoms");
         fs::create_dir_all(&dir)?;
@@ -102,7 +89,6 @@ impl SignedAtom {
     }
 }
 
-/// The single mutable pointer into the chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainHead {
     pub head_atom_id: String,
@@ -136,7 +122,6 @@ impl ChainHead {
     }
 }
 
-/// Result of attempting to append an atom to the chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppendResult {
     Appended {
@@ -162,7 +147,6 @@ pub fn append_atom(
     chain_root: &Path,
     atom_signature: String,
 ) -> AppendResult {
-    // 1. Admission gate (body)
     let decision = admit(&pack, policy, replayer);
     match decision {
         AdmitDecision::Reject { pack_id, reasons, .. } => {
@@ -171,11 +155,9 @@ pub fn append_atom(
         AdmitDecision::Accept { .. } => {}
     }
 
-    // 2. Load current head
     let head_path = chain_root.join("chain-head.json");
     let mut head = ChainHead::load(&head_path).unwrap_or_else(|_| ChainHead::genesis());
 
-    // 3. Build SignedAtom linked to current head
     let sequence = if head.head_atom_id == "GENESIS" {
         0
     } else {
@@ -189,7 +171,6 @@ pub fn append_atom(
         atom_signature,
     );
 
-    // 4. Persist atom
     if let Err(e) = atom.write_to_disk(chain_root) {
         return AppendResult::Refused {
             pack_id: atom.body.pack_id,
@@ -197,7 +178,6 @@ pub fn append_atom(
         };
     }
 
-    // 5. Advance head
     head.head_atom_id = atom.atom_id.clone();
     head.sequence = sequence;
     head.updated_at_utc = chrono::Utc::now().to_rfc3339();
@@ -215,11 +195,13 @@ pub fn append_atom(
     }
 }
 
-/// Convenience: append with default policy, no replayer, placeholder signature.
+/// Operational convenience until real keys land.
+/// Uses soft signature policy so placeholder signatures still append.
+/// Constitutional path: call append_atom with AdmitPolicy::default() and real signatures.
 pub fn append_atom_default(pack: EvidencePack, chain_root: &Path) -> AppendResult {
     append_atom(
         pack,
-        &AdmitPolicy::default(),
+        &policy_soft_signatures(),
         None,
         chain_root,
         "signature_placeholder".into(),
