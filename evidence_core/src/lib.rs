@@ -1,7 +1,8 @@
-//! evidence_core — minimal, deterministic EvidencePack emission + verification + admission + SignedAtom chain.
+//! evidence_core — EvidencePack + verify + admit + SignedAtom chain + founding keys.
 
 pub mod admit;
 pub mod atom;
+pub mod keys;
 pub mod verify;
 
 use serde::{Deserialize, Serialize};
@@ -53,7 +54,6 @@ impl EvidencePack {
     ) -> Self {
         let created_at_utc = Utc::now().to_rfc3339();
 
-        // canonicalization.md v3 §3.2
         let mut hasher = Sha256::new();
         hasher.update(EPACK_DOMAIN);
         hasher.update(created_at_utc.as_bytes());
@@ -83,7 +83,33 @@ impl EvidencePack {
         }
     }
 
-    /// Persist to a deterministic path under `evidence/`.
+    /// Build pack with empty signature, then sign body with founding key.
+    pub fn new_signed(
+        service: &str,
+        service_version: &str,
+        gateway_version: &str,
+        request: serde_json::Value,
+        response: serde_json::Value,
+        invariants: Vec<String>,
+        prev_hash: String,
+        runtime: RuntimeContext,
+        signing: &ed25519_dalek::SigningKey,
+    ) -> Self {
+        let mut pack = Self::new(
+            service,
+            service_version,
+            gateway_version,
+            request,
+            response,
+            invariants,
+            prev_hash,
+            runtime,
+            String::new(),
+        );
+        pack.signature = keys::sign_pack(&pack.pack_id, signing);
+        pack
+    }
+
     pub fn write_to_disk(&self, prefix: &str) -> std::io::Result<()> {
         std::fs::create_dir_all("evidence")?;
         let path = format!("evidence/{}_{}.json", prefix, self.pack_id);
@@ -92,7 +118,6 @@ impl EvidencePack {
     }
 }
 
-/// Convenience helper used by every service handler.
 pub fn emit_pack(
     service: &str,
     service_version: &str,
