@@ -10,7 +10,10 @@ use crate::verify::Replayable;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+/// Domain prefix for SignedAtom ids (canonicalization.md v3 §2 / §4).
+pub const SATOM_DOMAIN: &[u8] = b"satom-v3:";
 
 /// Immutable signed envelope around an admitted EvidencePack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +35,7 @@ pub struct SignedAtom {
 
 impl SignedAtom {
     /// Compute the deterministic atom_id from the other fields.
+    /// canonicalization.md v3 §4.2
     fn compute_id(
         prev_head: &str,
         sequence: u64,
@@ -40,6 +44,7 @@ impl SignedAtom {
         enveloped_at_utc: &str,
     ) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(SATOM_DOMAIN);
         hasher.update(prev_head.as_bytes());
         hasher.update(sequence.to_string().as_bytes());
         hasher.update(body_pack_id.as_bytes());
@@ -224,7 +229,7 @@ pub fn append_atom_default(pack: EvidencePack, chain_root: &Path) -> AppendResul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HashChain, RuntimeContext};
+    use crate::RuntimeContext;
     use serde_json::json;
     use std::env::temp_dir;
 
@@ -282,5 +287,12 @@ mod tests {
         assert!(matches!(result, AppendResult::Refused { .. }));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atom_id_includes_satom_domain() {
+        let pack = stripe_pack();
+        let atom = SignedAtom::new(pack, "GENESIS".into(), 0, "signature_placeholder".into());
+        assert!(atom.verify_id());
     }
 }

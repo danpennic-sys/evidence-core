@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use chrono::Utc;
 
+/// Domain prefix for EvidencePack hashes (canonicalization.md v3 §2 / §3).
+pub const EPACK_DOMAIN: &[u8] = b"epack-v3:";
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EvidencePack {
     pub pack_id: String,
@@ -50,7 +53,9 @@ impl EvidencePack {
     ) -> Self {
         let created_at_utc = Utc::now().to_rfc3339();
 
+        // canonicalization.md v3 §3.2
         let mut hasher = Sha256::new();
+        hasher.update(EPACK_DOMAIN);
         hasher.update(created_at_utc.as_bytes());
         hasher.update(service.as_bytes());
         hasher.update(service_version.as_bytes());

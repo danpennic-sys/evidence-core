@@ -1,4 +1,4 @@
-use crate::EvidencePack;
+use crate::{EvidencePack, EPACK_DOMAIN};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use serde_json::Value;
@@ -44,6 +44,7 @@ pub trait Replayable {
 }
 
 /// Pure verification function.
+/// Hash recomputation matches EvidencePack::new / canonicalization.md v3 §3.2.
 pub fn verify_pack<R: Replayable>(
     pack: &EvidencePack,
     replayer: Option<&R>,
@@ -52,8 +53,9 @@ pub fn verify_pack<R: Replayable>(
     let mut checks = Vec::new();
     let mut overall_passed = true;
 
-    // 1. Recompute current_hash
+    // 1. Recompute current_hash (epack-v3 domain)
     let mut hasher = Sha256::new();
+    hasher.update(EPACK_DOMAIN);
     hasher.update(pack.created_at_utc.as_bytes());
     hasher.update(pack.service.as_bytes());
     hasher.update(pack.service_version.as_bytes());
