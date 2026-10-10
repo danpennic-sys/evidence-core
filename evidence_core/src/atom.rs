@@ -152,7 +152,7 @@ pub enum AppendResult {
 
 /// The only write path into the chain.
 ///
-/// 1. Run admit()
+/// 1. Run admit() on the body
 /// 2. On Accept → wrap in SignedAtom, link to current head, persist atom, advance head
 /// 3. On Reject → return reasons, head unchanged
 pub fn append_atom(
@@ -162,10 +162,10 @@ pub fn append_atom(
     chain_root: &Path,
     atom_signature: String,
 ) -> AppendResult {
-    // 1. Admission gate
+    // 1. Admission gate (body)
     let decision = admit(&pack, policy, replayer);
     match decision {
-        AdmitDecision::Reject { pack_id, reasons } => {
+        AdmitDecision::Reject { pack_id, reasons, .. } => {
             return AppendResult::Refused { pack_id, reasons };
         }
         AdmitDecision::Accept { .. } => {}
