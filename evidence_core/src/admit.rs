@@ -1,10 +1,11 @@
 //! admit — pure admission predicate.
 //!
-//! Decides whether an EvidencePack may enter the chain.
+//! Decides whether an EvidencePack or SignedAtom may enter the chain.
 //! No I/O. No clocks. No network. Deterministic.
 //!
 //! This is the constitution in executable form for the current substrate layer.
 
+use crate::atom::SignedAtom;
 use crate::EvidencePack;
 use crate::verify::{verify_pack, Replayable, VerificationResult};
 use serde::{Deserialize, Serialize};
@@ -13,14 +14,17 @@ use std::collections::HashSet;
 /// Outcome of the admission predicate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AdmitDecision {
-    /// Pack is admitted. Ready for SignedAtom envelope + chain-head link.
+    /// Admitted. Ready for chain-head link (or already enveloped).
     Accept {
         pack_id: String,
+        /// Present when the subject was a SignedAtom.
+        atom_id: Option<String>,
         reason: String,
     },
-    /// Pack is refused. Must not enter the chain.
+    /// Refused. Must not enter the chain.
     Reject {
         pack_id: String,
+        atom_id: Option<String>,
         reasons: Vec<String>,
     },
 }
@@ -46,6 +50,8 @@ pub struct AdmitPolicy {
     pub require_runtime_context: bool,
     /// If true, hash_chain.current_hash must equal the recomputed hash.
     pub require_hash_integrity: bool,
+    /// If true, SignedAtom.signature must not be placeholder.
+    pub require_atom_signature: bool,
 }
 
 impl Default for AdmitPolicy {
@@ -82,11 +88,12 @@ impl Default for AdmitPolicy {
             require_real_signature: false, // soft until keys land
             require_runtime_context: true,
             require_hash_integrity: true,
+            require_atom_signature: false, // soft until keys land
         }
     }
 }
 
-/// Pure admission predicate.
+/// Pure admission predicate for an EvidencePack (body only).
 ///
 /// Steps (in order):
 /// 1. Structural completeness (pack_id, service, versions, hash_chain)
@@ -96,8 +103,6 @@ impl Default for AdmitPolicy {
 /// 5. Runtime context presence
 /// 6. Signature presence (policy-controlled)
 /// 7. Optional live replay (if a Replayable is supplied)
-///
-/// Returns Accept only when every enforced check passes.
 pub fn admit(
     pack: &EvidencePack,
     policy: &AdmitPolicy,
@@ -105,9 +110,7 @@ pub fn admit(
 ) -> AdmitDecision {
     let mut reasons: Vec<String> = Vec::new();
 
-    // ------------------------------------------------------------------
     // 1. Structural completeness
-    // ------------------------------------------------------------------
     if pack.pack_id.is_empty() {
         reasons.push("pack_id empty".into());
     }
@@ -127,18 +130,14 @@ pub fn admit(
         reasons.push("pack_id != hash_chain.current_hash".into());
     }
 
-    // ------------------------------------------------------------------
     // 2. Service allow-list
-    // ------------------------------------------------------------------
     if !policy.allowed_services.is_empty()
         && !policy.allowed_services.contains(&pack.service)
     {
         reasons.push(format!("service '{}' not in allow-list", pack.service));
     }
 
-    // ------------------------------------------------------------------
     // 3. Required invariants
-    // ------------------------------------------------------------------
     if let Some(required) = policy.required_invariants.get(&pack.service) {
         for code in required {
             if !pack.invariants.contains(code) {
@@ -147,11 +146,8 @@ pub fn admit(
         }
     }
 
-    // ------------------------------------------------------------------
-    // 4. Hash integrity (via the existing pure verifier)
-    // ------------------------------------------------------------------
+    // 4. Hash integrity
     if policy.require_hash_integrity {
-        // We call verify_pack without a replayer first so we only pay for hash + structure.
         let v: VerificationResult = verify_pack(pack, None::<&NullReplayer>, None);
         if !v.checks.iter().any(|c| c.name == "hash_chain" && c.passed) {
             reasons.push(format!(
@@ -161,9 +157,7 @@ pub fn admit(
         }
     }
 
-    // ------------------------------------------------------------------
     // 5. Runtime context
-    // ------------------------------------------------------------------
     if policy.require_runtime_context {
         if pack.runtime_context.node_id.is_empty()
             || pack.runtime_context.pod_id.is_empty()
@@ -173,18 +167,14 @@ pub fn admit(
         }
     }
 
-    // ------------------------------------------------------------------
-    // 6. Signature
-    // ------------------------------------------------------------------
+    // 6. Signature (body)
     if policy.require_real_signature {
         if pack.signature.is_empty() || pack.signature == "signature_placeholder" {
-            reasons.push("signature missing or still placeholder".into());
+            reasons.push("body signature missing or still placeholder".into());
         }
     }
 
-    // ------------------------------------------------------------------
     // 7. Optional live replay
-    // ------------------------------------------------------------------
     if let Some(r) = replayer {
         let v = verify_pack(pack, Some(r), None);
         if let Some(check) = v.checks.iter().find(|c| c.name == "response_replay") {
@@ -194,17 +184,96 @@ pub fn admit(
         }
     }
 
-    // ------------------------------------------------------------------
-    // Decision
-    // ------------------------------------------------------------------
     if reasons.is_empty() {
         AdmitDecision::Accept {
             pack_id: pack.pack_id.clone(),
-            reason: "all admission checks passed".into(),
+            atom_id: None,
+            reason: "all body admission checks passed".into(),
         }
     } else {
         AdmitDecision::Reject {
             pack_id: pack.pack_id.clone(),
+            atom_id: None,
+            reasons,
+        }
+    }
+}
+
+/// Pure admission predicate for a SignedAtom (envelope + body).
+///
+/// Steps (in order):
+/// 1. Envelope structure (atom_id, prev_head, enveloped_at_utc non-empty)
+/// 2. atom_id integrity (`verify_id()` — satom-v3 domain)
+/// 3. Optional prev_head continuity (if `expected_prev_head` is Some)
+/// 4. Envelope signature (policy-controlled)
+/// 5. Full body admission via `admit()`
+///
+/// Returns Accept only when every enforced check passes.
+pub fn admit_atom(
+    atom: &SignedAtom,
+    policy: &AdmitPolicy,
+    expected_prev_head: Option<&str>,
+    replayer: Option<&dyn Replayable>,
+) -> AdmitDecision {
+    let mut reasons: Vec<String> = Vec::new();
+
+    // 1. Envelope structure
+    if atom.atom_id.is_empty() {
+        reasons.push("atom_id empty".into());
+    }
+    if atom.prev_head.is_empty() {
+        reasons.push("prev_head empty".into());
+    }
+    if atom.enveloped_at_utc.is_empty() {
+        reasons.push("enveloped_at_utc empty".into());
+    }
+
+    // 2. atom_id integrity (satom-v3)
+    if !atom.verify_id() {
+        reasons.push("atom_id integrity failed (verify_id)".into());
+    }
+
+    // 3. prev_head continuity
+    if let Some(expected) = expected_prev_head {
+        if atom.prev_head != expected {
+            reasons.push(format!(
+                "prev_head mismatch: atom has '{}', expected '{}'",
+                atom.prev_head, expected
+            ));
+        }
+    }
+
+    // 4. Envelope signature
+    if policy.require_atom_signature {
+        if atom.signature.is_empty() || atom.signature == "signature_placeholder" {
+            reasons.push("atom signature missing or still placeholder".into());
+        }
+    }
+
+    // 5. Body admission
+    let body_decision = admit(&atom.body, policy, replayer);
+    match body_decision {
+        AdmitDecision::Reject {
+            reasons: body_reasons,
+            ..
+        } => {
+            for r in body_reasons {
+                reasons.push(format!("body: {}", r));
+            }
+        }
+        AdmitDecision::Accept { .. } => {}
+    }
+
+    if reasons.is_empty() {
+        AdmitDecision::Accept {
+            pack_id: atom.body.pack_id.clone(),
+            atom_id: Some(atom.atom_id.clone()),
+            reason: "all envelope + body admission checks passed".into(),
+        }
+    } else {
+        AdmitDecision::Reject {
+            pack_id: atom.body.pack_id.clone(),
+            atom_id: Some(atom.atom_id.clone()),
             reasons,
         }
     }
@@ -218,19 +287,24 @@ impl Replayable for NullReplayer {
     }
 }
 
-/// Convenience: admit with the default policy and no replayer.
+/// Convenience: admit body with the default policy and no replayer.
 pub fn admit_default(pack: &EvidencePack) -> AdmitDecision {
     admit(pack, &AdmitPolicy::default(), None)
+}
+
+/// Convenience: admit atom with the default policy, no expected head, no replayer.
+pub fn admit_atom_default(atom: &SignedAtom) -> AdmitDecision {
+    admit_atom(atom, &AdmitPolicy::default(), None, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HashChain, RuntimeContext};
+    use crate::atom::SignedAtom;
+    use crate::RuntimeContext;
     use serde_json::json;
 
     fn minimal_valid_pack() -> EvidencePack {
-        // Build a pack the same way the library does so the hash matches.
         EvidencePack::new(
             "stripe",
             "v20261008-A",
@@ -264,7 +338,6 @@ mod tests {
     fn admit_rejects_unknown_service() {
         let mut pack = minimal_valid_pack();
         pack.service = "unknown-svc".into();
-        // recompute hash so structural check still passes hash, but allow-list fails
         let decision = admit_default(&pack);
         assert!(!decision.is_accepted());
         if let AdmitDecision::Reject { reasons, .. } = decision {
@@ -280,6 +353,45 @@ mod tests {
         assert!(!decision.is_accepted());
         if let AdmitDecision::Reject { reasons, .. } = decision {
             assert!(reasons.iter().any(|r| r.contains("STRIPE-002")));
+        }
+    }
+
+    #[test]
+    fn admit_atom_accepts_well_formed_envelope() {
+        let pack = minimal_valid_pack();
+        let atom = SignedAtom::new(pack, "GENESIS".into(), 0, "signature_placeholder".into());
+        let decision = admit_atom_default(&atom);
+        assert!(decision.is_accepted(), "{:?}", decision);
+        if let AdmitDecision::Accept { atom_id, .. } = decision {
+            assert!(atom_id.is_some());
+        }
+    }
+
+    #[test]
+    fn admit_atom_rejects_prev_head_mismatch() {
+        let pack = minimal_valid_pack();
+        let atom = SignedAtom::new(pack, "GENESIS".into(), 0, "signature_placeholder".into());
+        let decision = admit_atom(
+            &atom,
+            &AdmitPolicy::default(),
+            Some("not-genesis"),
+            None,
+        );
+        assert!(!decision.is_accepted());
+        if let AdmitDecision::Reject { reasons, .. } = decision {
+            assert!(reasons.iter().any(|r| r.contains("prev_head mismatch")));
+        }
+    }
+
+    #[test]
+    fn admit_atom_rejects_tampered_atom_id() {
+        let pack = minimal_valid_pack();
+        let mut atom = SignedAtom::new(pack, "GENESIS".into(), 0, "signature_placeholder".into());
+        atom.atom_id = "deadbeef".into();
+        let decision = admit_atom_default(&atom);
+        assert!(!decision.is_accepted());
+        if let AdmitDecision::Reject { reasons, .. } = decision {
+            assert!(reasons.iter().any(|r| r.contains("verify_id")));
         }
     }
 }
