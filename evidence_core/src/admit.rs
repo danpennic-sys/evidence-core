@@ -35,25 +35,26 @@ impl AdmitDecision {
     }
 }
 
-/// Policy controls that the caller may tighten.
-/// Defaults are deliberately strict for the current substrate.
+/// Policy controls that the caller may tighten or relax.
 #[derive(Debug, Clone)]
 pub struct AdmitPolicy {
     /// Allowed service names. Empty = any non-empty service is allowed.
     pub allowed_services: HashSet<String>,
-    /// Required invariants that must appear in the pack.
-    /// Keyed by service name → list of required invariant codes.
+    /// Required invariants keyed by service name.
     pub required_invariants: std::collections::HashMap<String, Vec<String>>,
-    /// If true, signature must not be empty or the placeholder.
+    /// If true, body signature must not be empty or the placeholder.
     pub require_real_signature: bool,
     /// If true, runtime_context fields must be non-empty.
     pub require_runtime_context: bool,
     /// If true, hash_chain.current_hash must equal the recomputed hash.
     pub require_hash_integrity: bool,
-    /// If true, SignedAtom.signature must not be placeholder.
+    /// If true, SignedAtom.signature must not be empty or the placeholder.
     pub require_atom_signature: bool,
 }
 
+/// Default = pure admission boundary:
+/// hash-checked, signatures required, no runtime-context requirement, no replay.
+/// Service allow-list and invariant sets are prefilled for known services.
 impl Default for AdmitPolicy {
     fn default() -> Self {
         let mut required = std::collections::HashMap::new();
@@ -85,24 +86,32 @@ impl Default for AdmitPolicy {
                 "stripe".into(),
             ]),
             required_invariants: required,
-            require_real_signature: false, // soft until keys land
-            require_runtime_context: true,
+            require_real_signature: true,
+            require_runtime_context: false,
             require_hash_integrity: true,
-            require_atom_signature: false, // soft until keys land
+            require_atom_signature: true,
         }
     }
+}
+
+/// Soft policy for tests / pre-key era: signatures not required.
+pub fn policy_soft_signatures() -> AdmitPolicy {
+    let mut p = AdmitPolicy::default();
+    p.require_real_signature = false;
+    p.require_atom_signature = false;
+    p
 }
 
 /// Pure admission predicate for an EvidencePack (body only).
 ///
 /// Steps (in order):
-/// 1. Structural completeness (pack_id, service, versions, hash_chain)
+/// 1. Structural completeness
 /// 2. Service allow-list
-/// 3. Required invariants for that service
-/// 4. Hash integrity (recompute == stored)
-/// 5. Runtime context presence
-/// 6. Signature presence (policy-controlled)
-/// 7. Optional live replay (if a Replayable is supplied)
+/// 3. Required invariants
+/// 4. Hash integrity
+/// 5. Runtime context (policy)
+/// 6. Body signature (policy)
+/// 7. Optional live replay
 pub fn admit(
     pack: &EvidencePack,
     policy: &AdmitPolicy,
@@ -167,7 +176,7 @@ pub fn admit(
         }
     }
 
-    // 6. Signature (body)
+    // 6. Body signature
     if policy.require_real_signature {
         if pack.signature.is_empty() || pack.signature == "signature_placeholder" {
             reasons.push("body signature missing or still placeholder".into());
@@ -202,13 +211,11 @@ pub fn admit(
 /// Pure admission predicate for a SignedAtom (envelope + body).
 ///
 /// Steps (in order):
-/// 1. Envelope structure (atom_id, prev_head, enveloped_at_utc non-empty)
-/// 2. atom_id integrity (`verify_id()` — satom-v3 domain)
-/// 3. Optional prev_head continuity (if `expected_prev_head` is Some)
-/// 4. Envelope signature (policy-controlled)
-/// 5. Full body admission via `admit()`
-///
-/// Returns Accept only when every enforced check passes.
+/// 1. Envelope structure
+/// 2. atom_id integrity (satom-v3)
+/// 3. Optional prev_head continuity
+/// 4. Envelope signature (policy)
+/// 5. Full body admission via admit()
 pub fn admit_atom(
     atom: &SignedAtom,
     policy: &AdmitPolicy,
@@ -279,7 +286,6 @@ pub fn admit_atom(
     }
 }
 
-/// Null replayer used when we only need the hash check inside admit.
 struct NullReplayer;
 impl Replayable for NullReplayer {
     fn replay(&self, _request: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -287,12 +293,12 @@ impl Replayable for NullReplayer {
     }
 }
 
-/// Convenience: admit body with the default policy and no replayer.
+/// Default policy: pure, hash-checked, signatures required, no replay.
 pub fn admit_default(pack: &EvidencePack) -> AdmitDecision {
     admit(pack, &AdmitPolicy::default(), None)
 }
 
-/// Convenience: admit atom with the default policy, no expected head, no replayer.
+/// Default policy for atoms: pure, hash-checked, signatures required, no replay.
 pub fn admit_atom_default(atom: &SignedAtom) -> AdmitDecision {
     admit_atom(atom, &AdmitPolicy::default(), None, None)
 }
@@ -303,6 +309,8 @@ mod tests {
     use crate::atom::SignedAtom;
     use crate::RuntimeContext;
     use serde_json::json;
+
+    const TEST_SIG: &str = "test-sig-not-placeholder";
 
     fn minimal_valid_pack() -> EvidencePack {
         EvidencePack::new(
@@ -323,7 +331,7 @@ mod tests {
                 pod_id: "pod-1".into(),
                 region: "us-central-1".into(),
             },
-            "signature_placeholder".into(),
+            TEST_SIG.into(),
         )
     }
 
@@ -332,6 +340,17 @@ mod tests {
         let pack = minimal_valid_pack();
         let decision = admit_default(&pack);
         assert!(decision.is_accepted(), "{:?}", decision);
+    }
+
+    #[test]
+    fn admit_rejects_placeholder_signature_under_default_policy() {
+        let mut pack = minimal_valid_pack();
+        pack.signature = "signature_placeholder".into();
+        let decision = admit_default(&pack);
+        assert!(!decision.is_accepted());
+        if let AdmitDecision::Reject { reasons, .. } = decision {
+            assert!(reasons.iter().any(|r| r.contains("signature")));
+        }
     }
 
     #[test]
@@ -359,7 +378,7 @@ mod tests {
     #[test]
     fn admit_atom_accepts_well_formed_envelope() {
         let pack = minimal_valid_pack();
-        let atom = SignedAtom::new(pack, "GENESIS".into(), 0, "signature_placeholder".into());
+        let atom = SignedAtom::new(pack, "GENESIS".into(), 0, TEST_SIG.into());
         let decision = admit_atom_default(&atom);
         assert!(decision.is_accepted(), "{:?}", decision);
         if let AdmitDecision::Accept { atom_id, .. } = decision {
@@ -370,13 +389,8 @@ mod tests {
     #[test]
     fn admit_atom_rejects_prev_head_mismatch() {
         let pack = minimal_valid_pack();
-        let atom = SignedAtom::new(pack, "GENESIS".into(), 0, "signature_placeholder".into());
-        let decision = admit_atom(
-            &atom,
-            &AdmitPolicy::default(),
-            Some("not-genesis"),
-            None,
-        );
+        let atom = SignedAtom::new(pack, "GENESIS".into(), 0, TEST_SIG.into());
+        let decision = admit_atom(&atom, &AdmitPolicy::default(), Some("not-genesis"), None);
         assert!(!decision.is_accepted());
         if let AdmitDecision::Reject { reasons, .. } = decision {
             assert!(reasons.iter().any(|r| r.contains("prev_head mismatch")));
@@ -386,12 +400,20 @@ mod tests {
     #[test]
     fn admit_atom_rejects_tampered_atom_id() {
         let pack = minimal_valid_pack();
-        let mut atom = SignedAtom::new(pack, "GENESIS".into(), 0, "signature_placeholder".into());
+        let mut atom = SignedAtom::new(pack, "GENESIS".into(), 0, TEST_SIG.into());
         atom.atom_id = "deadbeef".into();
         let decision = admit_atom_default(&atom);
         assert!(!decision.is_accepted());
         if let AdmitDecision::Reject { reasons, .. } = decision {
             assert!(reasons.iter().any(|r| r.contains("verify_id")));
         }
+    }
+
+    #[test]
+    fn soft_policy_allows_placeholder_signatures() {
+        let mut pack = minimal_valid_pack();
+        pack.signature = "signature_placeholder".into();
+        let decision = admit(&pack, &policy_soft_signatures(), None);
+        assert!(decision.is_accepted(), "{:?}", decision);
     }
 }
