@@ -1,6 +1,7 @@
-//! evidence_core — minimal, deterministic EvidencePack emission + verification + admission.
+//! evidence_core — minimal, deterministic EvidencePack emission + verification + admission + SignedAtom chain.
 
 pub mod admit;
+pub mod atom;
 pub mod verify;
 
 use serde::{Deserialize, Serialize};

@@ -1,73 +1,86 @@
 # evidence-core
 
-Minimal, deterministic **EvidencePack** emission + verification + **admission** for Operator microservices.
+Minimal, deterministic **EvidencePack** emission + verification + **admission** + **SignedAtom chain-head** for Operator microservices.
 
 ## Workspace
 
 ```
 evidence-core/
-├── evidence_core/       shared library (emit + verify + admit)
-├── stripe-service/      full Stripe Checkout + verified webhook + EvidencePack
+├── evidence_core/       shared library
+│   ├── emit / verify / admit / atom
+├── stripe-service/      Stripe Checkout + webhook + EvidencePack
 └── examples/            drop-in wiring patterns
 ```
 
-## Admission predicate (`admit.rs`)
+## Chain flow (the only write path)
 
-Pure function. No I/O. No clocks. No network.
+```
+EvidencePack
+    │
+    ▼
+admit()                    ← pure predicate
+    │
+    ├─ Reject → stop
+    │
+    └─ Accept
+         │
+         ▼
+    SignedAtom             ← envelope (prev_head, sequence, body, signature)
+         │
+         ▼
+    atoms/<atom_id>.json   ← immutable
+         │
+         ▼
+    chain-head.json        ← single mutable pointer advanced
+```
+
+### Usage
 
 ```rust
-use evidence_core::admit::{admit, admit_default, AdmitPolicy, AdmitDecision};
+use evidence_core::atom::{append_atom_default, AppendResult};
+use std::path::Path;
 
-let decision = admit_default(&pack);
-match decision {
-    AdmitDecision::Accept { pack_id, reason } => { /* link to chain-head */ }
-    AdmitDecision::Reject { pack_id, reasons } => { /* refuse */ }
+let result = append_atom_default(pack, Path::new("./chain"));
+match result {
+    AppendResult::Appended { atom_id, sequence, new_head } => {
+        // atom is now the chain tip
+    }
+    AppendResult::Refused { pack_id, reasons } => {
+        // admission failed; head unchanged
+    }
 }
 ```
 
-Checks performed (in order):
+### SignedAtom fields
 
-1. Structural completeness (pack_id, service, versions, hash_chain)
-2. Service allow-list
-3. Required invariants per service
-4. Hash integrity (recomputed == stored)
-5. Runtime context presence
-6. Signature presence (policy flag)
-7. Optional live replay
+| Field | Meaning |
+|-------|--------|
+| `atom_id` | Content-addressed SHA-256 of the envelope |
+| `prev_head` | Previous chain-head (`GENESIS` for first) |
+| `sequence` | Monotonic 0-based counter |
+| `body` | The admitted EvidencePack |
+| `signature` | Placeholder until real keys |
+| `enveloped_at_utc` | Envelope creation time |
 
-Default policy already encodes the STRIPE-001..004 and TZ/GEO invariant sets.
+## Admission (`admit.rs`)
 
-## Services covered
+Pure. No I/O. No clocks. No network.
 
-| Service | Endpoints |
-|---------|-----------|
-| Time | `/v1/time/now`, `/v1/time/convert` |
-| Geo | `/v1/geo/ip` |
-| Date | `/v1/date/today`, `/v1/date/holiday` |
-| IPDiag | `/v1/ip/diag` |
-| Media | `/v1/media/suggest` |
-| Stripe | `checkout.session.completed` (sole payment confirmation boundary) |
+Checks: structure → allow-list → required invariants → hash integrity → runtime context → signature → optional replay.
 
-## Quick start — Stripe service
+## Stripe service
 
 ```bash
 cp stripe-service/.env.example stripe-service/.env
-# set STRIPE_SECRET_KEY=sk_test_...
-
 cargo run -p stripe-service
+# second terminal: stripe listen --forward-to localhost:4242/webhook
 ```
 
-Second terminal:
-
-```bash
-stripe listen --forward-to localhost:4242/webhook
-```
-
-Open http://localhost:4242, pay $10 with test card `4242 4242 4242 4242`.
-EvidencePack is written under `evidence/`. Run `admit_default` on it before any chain link.
+After a paid webhook the EvidencePack is written. Call `append_atom_default` on it to admit + link.
 
 ## Design constraints
 
-- Hash is a pure function of the fields written into the pack.
-- `admit` is pure; it never writes, never reads the clock, never talks to the network.
-- Signature field remains a placeholder until real Ed25519 / PQC keys land.
+- `admit` is pure.
+- Atoms are immutable once written.
+- Only `chain-head.json` is mutable.
+- Signature remains placeholder until Ed25519 / PQC keys land.
